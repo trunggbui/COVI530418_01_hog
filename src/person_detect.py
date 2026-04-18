@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -40,7 +41,20 @@ def _iter_image_files(folder: Path) -> Iterable[Path]:
                 yield p
 
 
-def load_dataset(data_dir: Path, cfg: DetectorConfig) -> tuple[np.ndarray, np.ndarray]:
+def _extract_feat(img_np: np.ndarray, cfg: DetectorConfig) -> np.ndarray:
+    return extract_hog(
+        img_np,
+        cell_size=cfg.cell_size,
+        block_size=cfg.block_size,
+        n_bins=cfg.n_bins,
+    ).astype(np.float32)
+
+
+def load_dataset(
+    data_dir: Path,
+    cfg: DetectorConfig,
+    extra_neg_dir: Path | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     pos_dir = data_dir / "pos"
     neg_dir = data_dir / "neg"
     if not pos_dir.exists() or not neg_dir.exists():
@@ -56,15 +70,20 @@ def load_dataset(data_dir: Path, cfg: DetectorConfig) -> tuple[np.ndarray, np.nd
                 if rgb.size != (cfg.win_w, cfg.win_h):
                     rgb = rgb.resize((cfg.win_w, cfg.win_h), Image.Resampling.BILINEAR)
                 img_np = np.array(rgb, dtype=np.uint8)
-
-            feat = extract_hog(
-                img_np,
-                cell_size=cfg.cell_size,
-                block_size=cfg.block_size,
-                n_bins=cfg.n_bins,
-            ).astype(np.float32)
-            x_list.append(feat)
+            x_list.append(_extract_feat(img_np, cfg))
             y_list.append(label)
+
+    if extra_neg_dir is not None and extra_neg_dir.exists():
+        hard_neg_files = sorted(_iter_image_files(extra_neg_dir))
+        for img_path in hard_neg_files:
+            with Image.open(img_path) as im:
+                rgb = im.convert("RGB")
+                if rgb.size != (cfg.win_w, cfg.win_h):
+                    rgb = rgb.resize((cfg.win_w, cfg.win_h), Image.Resampling.BILINEAR)
+                img_np = np.array(rgb, dtype=np.uint8)
+            x_list.append(_extract_feat(img_np, cfg))
+            y_list.append(-1)
+        print(f"  Hard negatives thêm vào: {len(hard_neg_files)} mẫu từ {extra_neg_dir}")
 
     if not x_list:
         raise RuntimeError("No training images found")
@@ -255,7 +274,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         n_bins=args.n_bins,
     )
 
-    x, y = load_dataset(Path(args.data_dir), cfg)
+    extra_neg = Path(args.extra_neg_dir) if args.extra_neg_dir else None
+    x, y = load_dataset(Path(args.data_dir), cfg, extra_neg_dir=extra_neg)
     x_train, y_train, x_val, y_val = train_val_split(x, y, val_ratio=args.val_ratio, seed=args.seed)
 
     mean, std = standardize_fit(x_train)
@@ -281,6 +301,105 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     save_model(Path(args.model_out), svm, mean, std, cfg)
     print(f"Saved model to: {args.model_out}")
+
+
+def cmd_split(args: argparse.Namespace) -> None:
+    """Chia dataset pos/ neg/ thành train/ và test/ theo tỉ lệ chỉ định."""
+    src = Path(args.data_dir)
+    out = Path(args.out_dir)
+    test_ratio = args.test_ratio
+    seed = args.seed
+
+    rng = np.random.default_rng(seed)
+
+    for split in ("train", "test"):
+        for cls in ("pos", "neg"):
+            (out / split / cls).mkdir(parents=True, exist_ok=True)
+
+    total_copied = {"train": 0, "test": 0}
+
+    for cls in ("pos", "neg"):
+        cls_dir = src / cls
+        if not cls_dir.exists():
+            raise FileNotFoundError(f"Không tìm thấy: {cls_dir}")
+
+        files = sorted(_iter_image_files(cls_dir))
+        if not files:
+            raise RuntimeError(f"Không có ảnh trong {cls_dir}")
+
+        indices = np.arange(len(files))
+        rng.shuffle(indices)
+        n_test = max(1, int(round(len(files) * test_ratio)))
+        test_idx = set(indices[:n_test].tolist())
+
+        for i, f in enumerate(files):
+            split = "test" if i in test_idx else "train"
+            shutil.copy2(f, out / split / cls / f.name)
+            total_copied[split] += 1
+
+    n_train_pos = len(list((out / "train" / "pos").iterdir()))
+    n_train_neg = len(list((out / "train" / "neg").iterdir()))
+    n_test_pos  = len(list((out / "test"  / "pos").iterdir()))
+    n_test_neg  = len(list((out / "test"  / "neg").iterdir()))
+
+    print(f"Split hoàn tất → {out}")
+    print(f"  train: {n_train_pos} pos  +  {n_train_neg} neg  =  {n_train_pos + n_train_neg} ảnh")
+    print(f"  test:  {n_test_pos}  pos  +  {n_test_neg}  neg  =  {n_test_pos  + n_test_neg}  ảnh")
+
+
+def cmd_mine(args: argparse.Namespace) -> None:
+    """Hard Negative Mining: chạy sliding window trên ảnh negative, lưu false positive patches."""
+    svm, mean, std, cfg = load_model(Path(args.model))
+
+    neg_dir = Path(args.neg_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    neg_files = sorted(_iter_image_files(neg_dir))
+    if not neg_files:
+        print(f"Không tìm thấy ảnh nào trong {neg_dir}")
+        return
+
+    print(f"Scanning {len(neg_files)} ảnh negative để tìm hard negatives...")
+    count = 0
+
+    for img_path in neg_files:
+        with Image.open(img_path) as im:
+            image_rgb = np.array(im.convert("RGB"), dtype=np.uint8)
+
+        orig_h, orig_w = image_rgb.shape[:2]
+
+        for s in args.scales:
+            scaled_w = max(1, int(round(orig_w * s)))
+            scaled_h = max(1, int(round(orig_h * s)))
+            if scaled_w < cfg.win_w or scaled_h < cfg.win_h:
+                continue
+
+            scaled_img = np.array(
+                Image.fromarray(image_rgb).resize((scaled_w, scaled_h), Image.Resampling.BILINEAR),
+                dtype=np.uint8,
+            )
+
+            for y in range(0, scaled_h - cfg.win_h + 1, args.stride):
+                for x in range(0, scaled_w - cfg.win_w + 1, args.stride):
+                    patch = scaled_img[y:y + cfg.win_h, x:x + cfg.win_w]
+                    feat = _extract_feat(patch, cfg)
+                    feat_s = standardize_apply(feat[None, :], mean, std)
+                    score = float(svm.decision_function(feat_s)[0])
+
+                    if score >= args.score_thr:
+                        Image.fromarray(patch).save(out_dir / f"hardneg_{count:06d}.jpg")
+                        count += 1
+                        if 0 < args.max_patches <= count:
+                            break
+                if 0 < args.max_patches <= count:
+                    break
+            if 0 < args.max_patches <= count:
+                break
+        if 0 < args.max_patches <= count:
+            break
+
+    print(f"Tìm được {count} hard negative patches → lưu vào: {out_dir}")
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
@@ -379,6 +498,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="HOG + Linear SVM person detector")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    p_split = sub.add_parser("split", help="Chia dataset thành train/ và test/")
+    p_split.add_argument("--data-dir", type=str, required=True,
+                         help="Thư mục gốc chứa pos/ và neg/")
+    p_split.add_argument("--out-dir", type=str, required=True,
+                         help="Thư mục đầu ra (sẽ tạo train/ và test/ bên trong)")
+    p_split.add_argument("--test-ratio", type=float, default=0.2,
+                         help="Tỉ lệ tập test (mặc định 0.2 = 20%%)")
+    p_split.add_argument("--seed", type=int, default=42)
+    p_split.set_defaults(func=cmd_split)
+
     p_train = sub.add_parser("train", help="Train Linear SVM on HOG features")
     p_train.add_argument("--data-dir", type=str, default="resources/images")
     p_train.add_argument("--model-out", type=str, default="models/hog_svm_model.npz")
@@ -391,7 +520,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--max-iter", type=int, default=2000)
     p_train.add_argument("--val-ratio", type=float, default=0.2)
     p_train.add_argument("--seed", type=int, default=42)
+    p_train.add_argument("--extra-neg-dir", type=str, default="",
+                         help="Thư mục chứa hard negative patches (tùy chọn)")
     p_train.set_defaults(func=cmd_train)
+
+    p_mine = sub.add_parser("mine", help="Hard Negative Mining: tìm false positives trên tập negative")
+    p_mine.add_argument("--model", type=str, required=True)
+    p_mine.add_argument("--neg-dir", type=str, required=True,
+                        help="Thư mục ảnh negative gốc")
+    p_mine.add_argument("--out-dir", type=str, default="resources/images/neg_hard",
+                        help="Thư mục lưu hard negative patches")
+    p_mine.add_argument("--stride", type=int, default=8)
+    p_mine.add_argument("--scales", type=float, nargs="+", default=[1.0, 0.9, 0.8, 0.7])
+    p_mine.add_argument("--score-thr", type=float, default=0.0,
+                        help="Ngưỡng score SVM để coi là false positive")
+    p_mine.add_argument("--max-patches", type=int, default=2000,
+                        help="Giới hạn số hard negative lưu (0 = không giới hạn)")
+    p_mine.set_defaults(func=cmd_mine)
 
     p_eval = sub.add_parser("evaluate", help="Evaluate model on a labeled dataset (pos/ neg/)")
     p_eval.add_argument("--model", type=str, required=True)

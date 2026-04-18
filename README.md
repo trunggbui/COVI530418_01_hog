@@ -9,12 +9,13 @@ Cài đặt thuật toán HOG (Histogram of Oriented Gradients) từ đầu và 
 ```
 hog/
 ├── src/
-│   ├── hog.py            # Cài đặt HOG (rgb2gray, gradient, histogram, normalize)
-│   └── person_detect.py  # Train / Evaluate / Detect
+│   ├── hog.py            # Cài đặt HOG: manual (minh họa) + fast (NumPy/SciPy)
+│   ├── person_detect.py  # Split / Train / Mine / Evaluate / Detect
+│   └── test_hog.py       # Unit tests (30 test cases)
 ├── resources/
 │   └── images/
-│       ├── pos/          # Ảnh chứa người (label +1)
-│       └── neg/          # Ảnh không có người (label -1)
+│       ├── pos/          # Ảnh chứa người (label +1) — 1038 ảnh
+│       └── neg/          # Ảnh không có người (label -1) — 1544 ảnh
 ├── models/               # Model .npz sau khi train
 ├── outputs/              # Kết quả detect
 └── requirements.txt
@@ -30,99 +31,173 @@ pip install -r requirements.txt
 
 ---
 
-## 1. Train
+## Quy trình đầy đủ
 
-Huấn luyện model từ tập dữ liệu. Dữ liệu cần có cấu trúc `pos/` và `neg/` bên trong thư mục chỉ định.
+### Bước 1 — Chia dataset 80/20
+
+Chia toàn bộ ảnh gốc thành tập train (80%) và tập test (20%) độc lập, stratified theo từng class.
 
 ```bash
 cd src
-python person_detect.py train \
+python person_detect.py split \
     --data-dir ../resources/images \
-    --model-out ../models/hog_svm_model.npz
+    --out-dir  ../resources/split \
+    --test-ratio 0.2 \
+    --seed 42
 ```
 
-**Tham số tùy chọn:**
-
-| Tham số | Mặc định | Mô tả |
-|---------|----------|-------|
-| `--data-dir` | `resources/images` | Thư mục chứa `pos/` và `neg/` |
-| `--model-out` | `models/hog_svm_model.npz` | Đường dẫn lưu model |
-| `--win-w` | `72` | Chiều rộng cửa sổ HOG (px) |
-| `--win-h` | `96` | Chiều cao cửa sổ HOG (px) |
-| `--cell-size` | `8` | Kích thước cell (px) |
-| `--block-size` | `2` | Kích thước block (số cell) |
-| `--n-bins` | `9` | Số bin histogram |
-| `--c` | `1.0` | Hệ số regularization LinearSVC |
-| `--val-ratio` | `0.2` | Tỉ lệ tập validation (0–1) |
-| `--seed` | `42` | Random seed |
-
-**Kết quả in ra:**
+Kết quả tạo ra:
 
 ```
-Train acc: 0.9823
-Val acc:   0.9512
-Saved model to: ../models/hog_svm_model.npz
+resources/split/
+├── train/
+│   ├── pos/   # 831 ảnh
+│   └── neg/   # 1235 ảnh
+└── test/
+    ├── pos/   # 207 ảnh
+    └── neg/   # 309 ảnh
 ```
 
 ---
 
-## 2. Evaluate (Đánh giá model)
-
-Đánh giá model trên tập dữ liệu có nhãn (cùng cấu trúc `pos/` / `neg/`).  
-Dùng để kiểm tra trên **tập test** riêng biệt sau khi train.
+### Bước 2 — Train lần 1 (model v1)
 
 ```bash
-cd src
-python person_detect.py evaluate \
-    --model ../models/hog_svm_model.npz \
-    --data-dir ../resources/images
+python person_detect.py train \
+    --data-dir ../resources/split/train \
+    --model-out ../models/hog_svm_v1.npz
 ```
 
-**Kết quả in ra:**
+```
+Train acc: 1.0000
+Val acc:   0.9443
+Saved model to: ../models/hog_svm_v1.npz
+```
+
+---
+
+### Bước 3 — Evaluate model v1 trên tập test độc lập
+
+```bash
+python person_detect.py evaluate \
+    --model    ../models/hog_svm_v1.npz \
+    --data-dir ../resources/split/test
+```
 
 ```
 ========================================
-  Tổng số mẫu  : 2583
-  Accuracy     : 0.9601  (2480/2583 đúng)
-  Precision    : 0.9712
-  Recall       : 0.9438
-  F1-score     : 0.9573
+  Tổng số mẫu  : 516
+  Accuracy     : 0.9341  (482/516 đúng)
+  Precision    : 0.8844
+  Recall       : 0.9614
+  F1-score     : 0.9213
 ========================================
 
 Confusion Matrix:
                    Predicted +1  Predicted -1
-Actual +1 (person)        981          59
-Actual -1 (no person)      44        1499
-
-Classification Report (sklearn):
-                  precision    recall  f1-score   support
-no person (-1)       0.96      0.97      0.97      1543
-   person (+1)       0.96      0.94      0.95      1040
-      accuracy                           0.96      2583
+Actual +1 (person)        199           8
+Actual -1 (no person)      26         283
 ```
-
-> **Giải thích chỉ số:**
-> - **Accuracy**: Tỉ lệ phân loại đúng tổng thể
-> - **Precision**: Trong số ảnh model dự đoán là "có người", bao nhiêu % đúng
-> - **Recall**: Trong số ảnh thực sự có người, model phát hiện được bao nhiêu %
-> - **F1-score**: Trung bình điều hòa của Precision và Recall
-> - **Confusion Matrix**: Ma trận nhầm lẫn — hàng là nhãn thực, cột là nhãn dự đoán
 
 ---
 
-## 3. Detect (Phát hiện người trong ảnh mới)
+### Bước 4 — Hard Negative Mining
 
-Chạy sliding window trên một ảnh bất kỳ để phát hiện vị trí người.
+Chạy sliding window trên `train/neg/`, thu thập các patch bị nhận nhầm là người (false positives).
+
+```bash
+python person_detect.py mine \
+    --model    ../models/hog_svm_v1.npz \
+    --neg-dir  ../resources/split/train/neg \
+    --out-dir  ../resources/split/neg_hard \
+    --score-thr 0.0 \
+    --max-patches 2000
+```
+
+```
+Scanning 1235 ảnh negative để tìm hard negatives...
+Tìm được 18 hard negative patches → lưu vào: ../resources/split/neg_hard
+```
+
+---
+
+### Bước 5 — Train lần 2 (model v2, có hard negatives)
+
+```bash
+python person_detect.py train \
+    --data-dir      ../resources/split/train \
+    --extra-neg-dir ../resources/split/neg_hard \
+    --model-out     ../models/hog_svm_v2.npz
+```
+
+```
+  Hard negatives thêm vào: 18 mẫu từ ../resources/split/neg_hard
+Train acc: 1.0000
+Val acc:   0.9591
+Saved model to: ../models/hog_svm_v2.npz
+```
+
+---
+
+### Bước 6 — Evaluate model v2 trên tập test độc lập
+
+```bash
+python person_detect.py evaluate \
+    --model    ../models/hog_svm_v2.npz \
+    --data-dir ../resources/split/test
+```
+
+```
+========================================
+  Tổng số mẫu  : 516
+  Accuracy     : 0.9360  (483/516 đúng)
+  Precision    : 0.8919
+  Recall       : 0.9565
+  F1-score     : 0.9231
+========================================
+
+Confusion Matrix:
+                   Predicted +1  Predicted -1
+Actual +1 (person)        198           9
+Actual -1 (no person)      24         285
+```
+
+---
+
+## Kết quả so sánh v1 vs v2
+
+> Đánh giá trên **516 ảnh test hoàn toàn độc lập** (không có trong quá trình train).
+
+| Chỉ số | Model v1 | Model v2 (+HNM) | Thay đổi |
+|--------|:--------:|:---------------:|:--------:|
+| Val acc (trong train) | 0.9443 | **0.9591** | ↑ +0.0148 |
+| **Accuracy** | 0.9341 | **0.9360** | ↑ +0.0019 |
+| **Precision** | 0.8844 | **0.8919** | ↑ +0.0075 |
+| Recall | **0.9614** | 0.9565 | ↓ −0.0049 |
+| **F1-score** | 0.9213 | **0.9231** | ↑ +0.0018 |
+| False Positive (nhận nhầm neg→pos) | 26 | **24** | ↓ −2 |
+| False Negative (bỏ sót người) | **8** | 9 | ↑ +1 |
+
+**Nhận xét:**
+
+- Hard Negative Mining với 18 mẫu cải thiện rõ **Val acc** (+1.48%) và **Precision** (+0.75%): model ít nhận nhầm ảnh không có người hơn (FP: 26 → 24).
+- **Recall** giảm nhẹ (bỏ sót thêm 1 người: FN 8 → 9) — đây là đánh đổi điển hình khi tăng precision.
+- **Train acc = 1.0000** ở cả hai lần cho thấy model overfit hoàn toàn trên tập train; kết quả thực tế phải xem trên tập test độc lập.
+- Hiệu quả của HNM sẽ rõ hơn khi dataset gốc có nhiều hard case hơn hoặc tập negative đa dạng hơn.
+
+---
+
+## Các lệnh khác
+
+### Detect (phát hiện người trong ảnh mới)
 
 ```bash
 cd src
 python person_detect.py detect \
-    --model ../models/hog_svm_model.npz \
-    --image ../resources/images/jiahao.jpeg \
+    --model  ../models/hog_svm_v2.npz \
+    --image  ../resources/images/jiahao.jpeg \
     --output ../outputs/result.jpg
 ```
-
-**Tham số tùy chọn:**
 
 | Tham số | Mặc định | Mô tả |
 |---------|----------|-------|
@@ -132,15 +207,31 @@ python person_detect.py detect \
 | `--iou-thr` | `0.3` | Ngưỡng IoU cho NMS |
 | `--max-side` | `512` | Resize cạnh dài nhất về giá trị này |
 
-**Kết quả in ra:**
+### Unit Test
 
-```
-Detections before NMS: 142
-Detections after NMS:  3
-Saved result to: ../outputs/result.jpg
+```bash
+cd src
+python -m unittest test_hog -v
+# Ran 30 tests — OK
 ```
 
-Ảnh kết quả được lưu tại `--output` với bounding box và điểm confidence.
+---
+
+## Tham số train đầy đủ
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `--data-dir` | _(bắt buộc)_ | Thư mục chứa `pos/` và `neg/` |
+| `--model-out` | `models/hog_svm_model.npz` | Đường dẫn lưu model |
+| `--extra-neg-dir` | _(trống)_ | Thư mục hard negatives (từ lệnh `mine`) |
+| `--win-w` | `72` | Chiều rộng cửa sổ HOG (px) |
+| `--win-h` | `96` | Chiều cao cửa sổ HOG (px) |
+| `--cell-size` | `8` | Kích thước cell (px) |
+| `--block-size` | `2` | Kích thước block (số cell) |
+| `--n-bins` | `9` | Số bin histogram |
+| `--c` | `1.0` | Hệ số regularization LinearSVC |
+| `--val-ratio` | `0.2` | Tỉ lệ tập validation (trong train) |
+| `--seed` | `42` | Random seed |
 
 ---
 
@@ -150,15 +241,19 @@ Saved result to: ../outputs/result.jpg
 Ảnh RGB
    ↓ rgb2gray
 Grayscale
-   ↓ compute_gradients  (kernel [-1,0,1])
-Magnitude + Orientation (0–180°)
-   ↓ build_hog_cells    (cell 8×8)
+   ↓ compute_gradients  (kernel [-1,0,1], scipy.ndimage.convolve)
+Magnitude + Orientation (0–180°, unsigned)
+   ↓ build_hog_cells    (cell 8×8, bilinear vote, np.bincount)
 Cell histograms (n_cells_y × n_cells_x × 9)
-   ↓ normalize_blocks   (block 2×2, L2-norm)
+   ↓ normalize_blocks   (block 2×2, stride=1, L2-norm)
 HOG feature vector (3780 chiều cho cửa sổ 72×96)
-   ↓ LinearSVC
-Person / No Person
+   ↓ LinearSVC (sklearn)
+Person (+1) / No Person (-1)
 ```
+
+> `hog.py` có 2 bản cài đặt song song:
+> - **Manual** (`fast=False`): vòng lặp Python thuần, để minh họa từng bước thuật toán
+> - **Fast** (`fast=True`, mặc định): NumPy + SciPy, nhanh hơn ~74× so với manual
 
 ---
 
