@@ -165,3 +165,4 @@ Person / No Person
 ## Tài liệu tham khảo
 
 - N. Dalal and B. Triggs, *"Histograms of Oriented Gradients for Human Detection"*, CVPR 2005.
+- Dataset: [nishai/Person-Detection-SVM-HOG](https://github.com/nishai/Person-Detection-SVM-HOG/tree/master)
